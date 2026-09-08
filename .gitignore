@@ -1,0 +1,15 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# StackPilot local state
+.stackpilot/
+demo-workspace/
+cli-test/
+.test-*/
+
+# misc
+*.log
+.DS_Store

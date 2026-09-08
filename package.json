@@ -1,0 +1,38 @@
+{
+  "name": "stackpilot",
+  "version": "0.1.0",
+  "description": "AI-assisted stacked pull request manager for Azure DevOps",
+  "type": "module",
+  "bin": {
+    "stackpilot": "dist/index.js",
+    "sp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "demo": "tsx src/demo/runDemo.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "clean": "rimraf dist"
+  },
+  "keywords": [
+    "azure-devops",
+    "stacked-pr",
+    "pull-request",
+    "git",
+    "ai"
+  ],
+  "author": "StackPilot",
+  "license": "MIT",
+  "dependencies": {
+    "azure-devops-node-api": "^14.1.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "rimraf": "^6.0.1",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2"
+  }
+}
