@@ -16,6 +16,7 @@ import type {
  */
 export class MockProvider implements Provider {
   readonly name = "mock";
+  readonly comments: { prId: number; content: string }[] = [];
   private prs = new Map<number, PullRequest>();
   private branches: Set<string>;
   private nextPrId = 101;
@@ -134,9 +135,10 @@ export class MockProvider implements Provider {
     return pr ? { ...pr } : undefined;
   }
 
-  async addComment(prId: number, _content: string): Promise<number> {
+  async addComment(prId: number, content: string): Promise<number> {
     if (!this.prs.has(prId)) throw new Error(`PR ${prId} not found`);
     const id = this.nextThreadId++;
+    this.comments.push({ prId, content });
     this.save();
     return id;
   }

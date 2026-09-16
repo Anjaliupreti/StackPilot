@@ -12,6 +12,7 @@ import type {
   StackEffect,
   StackPilotConfig,
 } from "./types.js";
+import { validateStack } from "./stackValidator.js";
 
 export interface EngineDeps {
   provider: Provider;
@@ -34,6 +35,15 @@ export interface SyncItem {
   drifted: boolean;
   operations: PlannedOperation[];
 }
+
+export interface SubmitResult {
+  operations: PlannedOperation[];
+  created: PullRequest[];
+  updated: PullRequest[];
+  reused: PullRequest[];
+}
+
+export type NavigationTarget = "top" | "bottom" | "up" | "down" | "trunk";
 
 /**
  * The StackPilot engine. Owns the stack lifecycle: create → push → open PRs →
@@ -58,6 +68,10 @@ export class StackManager {
     if (existing) throw new Error(`Stack "${name}" already exists`);
 
     const now = new Date().toISOString();
+    const [branchSha, baseSha] = await Promise.all([
+      safeSha(this.deps.git, bottomBranch),
+      safeSha(this.deps.git, trunk),
+    ]);
     const stack: Stack = {
       id: randomUUID(),
       name,
@@ -68,7 +82,8 @@ export class StackManager {
           level: 0,
           name: bottomBranch,
           base: trunk,
-          lastKnownSha: await safeSha(this.deps.git, bottomBranch),
+          lastKnownSha: branchSha,
+          lastKnownBaseSha: baseSha,
         },
       ],
       createdAt: now,
@@ -93,11 +108,16 @@ export class StackManager {
     }
     const top = topBranch(stack);
     const level = stack.branches.length;
+    const [branchSha, baseSha] = await Promise.all([
+      safeSha(this.deps.git, branch),
+      safeSha(this.deps.git, top.name),
+    ]);
     stack.branches.push({
       level,
       name: branch,
       base: top.name,
-      lastKnownSha: await safeSha(this.deps.git, branch),
+      lastKnownSha: branchSha,
+      lastKnownBaseSha: baseSha,
     });
     await this.deps.store.saveStack(stack);
     await this.deps.store.appendAudit({
@@ -111,6 +131,104 @@ export class StackManager {
   }
 
   // ---- pull requests ----------------------------------------------------
+
+  /**
+   * Push every branch and make its active PR match the stack, bottom-up.
+   * Existing PRs are reused so this operation is safe to run repeatedly.
+   */
+  async submit(stackName: string): Promise<SubmitResult> {
+    const stack = this.requireStack(stackName);
+    await validateStack(stack, this.deps.git, "submit");
+    const operations: PlannedOperation[] = [];
+    const created: PullRequest[] = [];
+    const updated: PullRequest[] = [];
+    const reused: PullRequest[] = [];
+    const activeByBranch = activePullRequestsByBranch(
+      await this.deps.provider.listPullRequests()
+    );
+    let basePr: PullRequest | undefined;
+
+    for (const b of [...stack.branches].sort((a, z) => a.level - z.level)) {
+      const push = this.deps.git.planPush(b.name, false);
+      await this.deps.git.apply(push);
+      operations.push(push);
+
+      const dependsOn = basePr ? [basePr.id] : [];
+      let pr = activeByBranch.get(b.name);
+      let needsDependencyComment = false;
+      if (!pr) {
+        const description = await this.buildDescription(stack, b, basePr);
+        pr = await this.deps.provider.createPullRequest({
+          title: titleFor(b),
+          description,
+          sourceBranch: b.name,
+          targetBranch: b.base,
+          dependsOn,
+        });
+        created.push(pr);
+        needsDependencyComment = basePr !== undefined;
+        await this.deps.store.appendAudit({
+          action: "pr.create",
+          actor: this.actor,
+          stackId: stack.id,
+          summary: `Opened PR !${pr.id} for ${b.name} → ${b.base}`,
+          details: { prId: pr.id, dependsOn },
+          applied: true,
+        });
+      } else {
+        const targetChanged = pr.targetBranch !== b.base;
+        const dependencyChanged = !sameNumbers(pr.dependsOn, dependsOn);
+        if (targetChanged || dependencyChanged) {
+          pr = await this.deps.provider.updatePullRequest(pr.id, {
+            targetBranch: b.base,
+            dependsOn,
+          });
+          updated.push(pr);
+          needsDependencyComment =
+            dependencyChanged && basePr !== undefined;
+          await this.deps.store.appendAudit({
+            action: "pr.update",
+            actor: this.actor,
+            stackId: stack.id,
+            summary: `Updated PR !${pr.id} to target ${b.base}`,
+            details: { prId: pr.id, dependsOn },
+            applied: true,
+          });
+        } else {
+          reused.push(pr);
+        }
+      }
+
+      if (needsDependencyComment && basePr) {
+        await this.deps.provider.addComment(
+          pr.id,
+          `🧩 **StackPilot**: this PR is stacked on !${basePr.id}. Review that one first.`
+        );
+        await this.deps.store.appendAudit({
+          action: "pr.link",
+          actor: this.actor,
+          stackId: stack.id,
+          summary: `Linked PR !${pr.id} to depend on !${basePr.id}`,
+          applied: true,
+        });
+      }
+
+      b.prId = pr.id;
+      this.prCache.set(pr.id, pr);
+      basePr = pr;
+    }
+
+    await this.deps.store.saveStack(stack);
+    await this.deps.store.appendAudit({
+      action: "stack.submit",
+      actor: this.actor,
+      stackId: stack.id,
+      summary: `Submitted ${stack.name}: ${created.length} created, ${updated.length} updated, ${reused.length} reused`,
+      details: { operations: operations.map((op) => op.command) },
+      applied: true,
+    });
+    return { operations, created, updated, reused };
+  }
 
   /** Create PRs for any stacked branch that doesn't yet have one, bottom-up. */
   async createPullRequests(
@@ -216,26 +334,36 @@ export class StackManager {
    */
   async sync(stackName: string, apply: boolean): Promise<PlanResult> {
     const stack = this.requireStack(stackName);
+    await validateStack(stack, this.deps.git, "sync");
     const messages: string[] = [];
     const operations: PlannedOperation[] = [];
+    let parentWillMove = false;
 
     for (const b of [...stack.branches].sort((a, z) => a.level - z.level)) {
-      const currentSha = await safeSha(this.deps.git, b.name);
       const baseSha = await safeSha(this.deps.git, b.base);
-      const drifted =
-        b.lastKnownSha !== undefined && b.lastKnownSha !== currentSha;
+      const oldBaseSha =
+        b.lastKnownBaseSha ?? this.baseBranch(stack, b)?.lastKnownSha;
       const baseMoved =
-        (this.baseBranch(stack, b)?.lastKnownSha ?? baseSha) !== baseSha;
+        oldBaseSha !== undefined &&
+        baseSha !== undefined &&
+        oldBaseSha !== baseSha;
+      const needsRebase = baseMoved || parentWillMove;
 
-      if (drifted || baseMoved) {
-        const rebase = this.deps.git.planRebase(b.name, b.base, b.base);
+      if (needsRebase && oldBaseSha) {
+        const rebase = this.deps.git.planRebase(
+          b.name,
+          b.base,
+          oldBaseSha
+        );
         const push = this.deps.git.planPush(b.name, true);
         operations.push(rebase, push);
         messages.push(
-          `↻ ${b.name} needs restack onto ${b.base} (base moved / branch drifted)`
+          `↻ ${b.name} needs restack onto ${b.base} (base moved)`
         );
+        parentWillMove = true;
       } else {
         messages.push(`✓ ${b.name} is up to date`);
+        parentWillMove = false;
       }
     }
 
@@ -262,6 +390,7 @@ export class StackManager {
    */
   async merge(stackName: string, apply: boolean): Promise<PlanResult> {
     const stack = this.requireStack(stackName);
+    await validateStack(stack, this.deps.git, "merge");
     const ordered = [...stack.branches].sort((a, z) => a.level - z.level);
     const bottom = ordered[0];
     if (!bottom?.prId) {
@@ -272,9 +401,15 @@ export class StackManager {
     const messages: string[] = [`Merge bottom PR !${bottom.prId} (${bottom.name}) into ${bottom.base}`];
 
     for (const b of ordered.slice(1)) {
-      operations.push(this.deps.git.planRebase(b.name, bottom.base, bottom.name));
+      const newBase = b.base === bottom.name ? bottom.base : b.base;
+      const oldBaseSha =
+        b.lastKnownBaseSha ?? this.baseBranch(stack, b)?.lastKnownSha;
+      if (!oldBaseSha) {
+        throw new Error(`Cannot restack ${b.name}: previous base SHA is unknown`);
+      }
+      operations.push(this.deps.git.planRebase(b.name, newBase, oldBaseSha));
       operations.push(this.deps.git.planPush(b.name, true));
-      messages.push(`Retarget ${b.name} onto ${b.base === bottom.name ? bottom.base : b.base}`);
+      messages.push(`Retarget ${b.name} onto ${newBase}`);
     }
 
     return this.runOrGate({
@@ -298,7 +433,12 @@ export class StackManager {
     if (effect.kind === "sync") {
       const stack = this.requireStack(effect.stackId);
       for (const b of stack.branches) {
-        b.lastKnownSha = await safeSha(this.deps.git, b.name);
+        const [branchSha, baseSha] = await Promise.all([
+          safeSha(this.deps.git, b.name),
+          safeSha(this.deps.git, b.base),
+        ]);
+        b.lastKnownSha = branchSha;
+        b.lastKnownBaseSha = baseSha;
       }
       await this.deps.store.saveStack(stack);
       return;
@@ -315,6 +455,14 @@ export class StackManager {
       level: i,
       base: i === 0 ? trunkTarget : ordered[i].name,
     }));
+    for (const b of stack.branches) {
+      const [branchSha, baseSha] = await Promise.all([
+        safeSha(this.deps.git, b.name),
+        safeSha(this.deps.git, b.base),
+      ]);
+      b.lastKnownSha = branchSha;
+      b.lastKnownBaseSha = baseSha;
+    }
     const newBottom = stack.branches[0];
     if (newBottom?.prId) {
       await this.deps.provider.updatePullRequest(newBottom.prId, {
@@ -400,6 +548,52 @@ export class StackManager {
   }
 
   // ---- helpers ----------------------------------------------------------
+
+  async navigate(
+    stackName: string,
+    target: NavigationTarget
+  ): Promise<string> {
+    const stack = this.requireStack(stackName);
+    const ordered = [...stack.branches].sort((a, b) => a.level - b.level);
+    const current = await this.deps.git.currentBranch();
+    let destination: string;
+
+    switch (target) {
+      case "top":
+        destination = ordered.at(-1)?.name ?? stack.trunk;
+        break;
+      case "bottom":
+        destination = ordered[0]?.name ?? stack.trunk;
+        break;
+      case "trunk":
+        destination = stack.trunk;
+        break;
+      case "up": {
+        if (current === stack.trunk) {
+          destination = ordered[0]?.name ?? stack.trunk;
+          break;
+        }
+        const index = ordered.findIndex((b) => b.name === current);
+        if (index < 0) throw new Error(`Branch ${current} is not in stack ${stack.name}`);
+        destination = ordered[Math.min(index + 1, ordered.length - 1)].name;
+        break;
+      }
+      case "down": {
+        const index = ordered.findIndex((b) => b.name === current);
+        if (index < 0) throw new Error(`Branch ${current} is not in stack ${stack.name}`);
+        destination = ordered[Math.max(index - 1, 0)].name;
+        break;
+      }
+    }
+
+    if (!(await this.deps.git.branchExists(destination))) {
+      throw new Error(`Branch ${destination} does not exist locally`);
+    }
+    if (destination !== current) {
+      await this.deps.git.switchBranch(destination);
+    }
+    return destination;
+  }
 
   /**
    * Either run mutating operations immediately (when apply=true and approval is
@@ -503,6 +697,26 @@ function topBranch(stack: Stack): StackedBranch {
 function titleFor(b: StackedBranch): string {
   const tail = b.name.split("/").pop() ?? b.name;
   return tail.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function activePullRequestsByBranch(
+  prs: PullRequest[]
+): Map<string, PullRequest> {
+  const active = new Map<string, PullRequest>();
+  for (const pr of prs) {
+    if (pr.status !== "active" && pr.status !== "draft") continue;
+    if (active.has(pr.sourceBranch)) {
+      throw new Error(
+        `Multiple active PRs found for branch ${pr.sourceBranch}`
+      );
+    }
+    active.set(pr.sourceBranch, pr);
+  }
+  return active;
+}
+
+function sameNumbers(a: number[], b: number[]): boolean {
+  return a.length === b.length && a.every((value, i) => value === b[i]);
 }
 
 async function safeSha(git: GitService, branch: string): Promise<string | undefined> {

@@ -90,6 +90,24 @@ program
     console.log(renderStack(stack, await ctx.engine.prsFor(stack)));
   });
 
+// ---- submit -------------------------------------------------------------
+program
+  .command("submit <stack>")
+  .description("Push branches and create or update all stacked pull requests")
+  .action(async (stackName) => {
+    const ctx = await buildContext();
+    const result = await ctx.engine.submit(stackName);
+    for (const op of result.operations) {
+      log.ok(op.description);
+    }
+    log.ok(
+      `Submitted ${stackName}: ${result.created.length} created, ` +
+        `${result.updated.length} updated, ${result.reused.length} reused`
+    );
+    const stack = ctx.engine.requireStack(stackName);
+    console.log(renderStack(stack, await ctx.engine.prsFor(stack)));
+  });
+
 // ---- describe -----------------------------------------------------------
 program
   .command("describe <stack> [branch]")
@@ -203,6 +221,26 @@ program
     await ctx.engine.deny(id);
     log.ok(`Denied ${id}.`);
   });
+
+// ---- navigation ---------------------------------------------------------
+const navigationDescriptions = {
+  top: "Switch to the top branch of a stack",
+  bottom: "Switch to the bottom branch of a stack",
+  up: "Switch one branch toward the top of a stack",
+  down: "Switch one branch toward the trunk of a stack",
+  trunk: "Switch to the trunk branch of a stack",
+} as const;
+
+for (const target of ["top", "bottom", "up", "down", "trunk"] as const) {
+  program
+    .command(`${target} <stack>`)
+    .description(navigationDescriptions[target])
+    .action(async (stackName) => {
+      const ctx = await buildContext();
+      const branch = await ctx.engine.navigate(stackName, target);
+      log.ok(`Switched to ${branch}`);
+    });
+}
 
 // ---- comment (simulate comment-based command) ---------------------------
 program

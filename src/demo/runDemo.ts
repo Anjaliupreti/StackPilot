@@ -78,11 +78,18 @@ async function main() {
   let stack = engine.requireStack("auth-feature");
   console.log(renderStack(stack, []));
 
-  step("2. Open linked pull requests (bottom-up, with dependency links)");
-  const created = await engine.createPullRequests("auth-feature", { draft: false });
-  for (const pr of created) {
+  step("2. Submit branches and linked pull requests (bottom-up)");
+  const submitted = await engine.submit("auth-feature");
+  for (const pr of submitted.created) {
     console.log(`   ${chalk.green("✓")} PR !${pr.id}  ${pr.sourceBranch} → ${pr.targetBranch}  ${pr.dependsOn.length ? chalk.dim("depends on !" + pr.dependsOn.join(", !")) : ""}`);
   }
+  const repeated = await engine.submit("auth-feature");
+  console.log(
+    chalk.dim(
+      `   Repeated submit: ${repeated.created.length} created, ` +
+        `${repeated.updated.length} updated, ${repeated.reused.length} reused`
+    )
+  );
   stack = engine.requireStack("auth-feature");
   console.log(renderStack(stack, await engine.prsFor(stack)));
 
