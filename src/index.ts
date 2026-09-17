@@ -99,18 +99,17 @@ program
 program
   .command("submit <stack>")
   .description("Push branches and create or update all stacked pull requests")
-  .action(async (stackName) => {
+  .option("--apply", "execute (or request approval for) the plan", false)
+  .action(async (stackName, opts) => {
     const ctx = await buildContext();
-    const result = await ctx.engine.submit(stackName);
-    for (const op of result.operations) {
-      log.ok(op.description);
+    const result = await ctx.engine.submit(stackName, opts.apply);
+    log.title("Submit");
+    console.log(renderPlan(result.messages, result.operations));
+    if (result.approval) {
+      log.warn(`Approval required: stackpilot approve ${result.approval.id}`);
+    } else if (result.applied) {
+      log.ok("Submit applied.");
     }
-    log.ok(
-      `Submitted ${stackName}: ${result.created.length} created, ` +
-        `${result.updated.length} updated, ${result.reused.length} reused`
-    );
-    const stack = ctx.engine.requireStack(stackName);
-    console.log(renderStack(stack, await ctx.engine.prsFor(stack)));
   });
 
 // ---- describe -----------------------------------------------------------

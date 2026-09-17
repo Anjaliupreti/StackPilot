@@ -93,7 +93,8 @@ node dist/index.js create auth-feature feature/auth-schema
 node dist/index.js push   auth-feature feature/auth-service
 node dist/index.js push   auth-feature feature/auth-api
 
-node dist/index.js submit   auth-feature          # push and create/update linked PRs
+node dist/index.js submit   auth-feature          # preview linked PR submission
+node dist/index.js submit   auth-feature --apply  # execute/request approval
 node dist/index.js describe auth-feature --show    # AI descriptions
 node dist/index.js review   auth-feature           # stack-aware review
 node dist/index.js status   auth-feature

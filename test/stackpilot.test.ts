@@ -72,7 +72,7 @@ test("stack status JSON is ordered and machine-readable", async () => {
   await engine.createStack("s", "main", "a");
   await engine.push("s", "b");
   await engine.push("s", "c");
-  await engine.submit("s");
+  await engine.submit("s", true);
 
   const stack = engine.requireStack("s");
   const output = JSON.parse(
@@ -171,7 +171,7 @@ test("submit reuses existing PRs and creates only missing PRs", async () => {
     targetBranch: "main",
     dependsOn: [],
   });
-  const second = await provider.createPullRequest({
+  await provider.createPullRequest({
     title: "B",
     description: "",
     sourceBranch: "b",
@@ -179,15 +179,10 @@ test("submit reuses existing PRs and creates only missing PRs", async () => {
     dependsOn: [first.id],
   });
 
-  const result = await engine.submit("s");
+  const result = await engine.submit("s", true);
   const prs = await provider.listPullRequests();
 
-  assert.equal(result.created.length, 1);
-  assert.equal(result.created[0].sourceBranch, "c");
-  assert.deepEqual(
-    result.reused.map((pr) => pr.id),
-    [first.id, second.id]
-  );
+  assert.equal(result.applied, true);
   assert.equal(prs.length, 3);
   assert.deepEqual(
     git.applied.map((op) => op.command),
@@ -198,7 +193,10 @@ test("submit reuses existing PRs and creates only missing PRs", async () => {
     ]
   );
   assert.equal(provider.comments.length, 1);
-  assert.equal(provider.comments[0].prId, result.created[0].id);
+  assert.equal(
+    provider.comments[0].prId,
+    prs.find((pr) => pr.sourceBranch === "c")?.id
+  );
 });
 
 test("submit corrects PR links without duplicating PRs or comments", async () => {
@@ -222,14 +220,12 @@ test("submit corrects PR links without duplicating PRs or comments", async () =>
     dependsOn: [],
   });
 
-  const firstRun = await engine.submit("s");
-  const secondRun = await engine.submit("s");
+  const firstRun = await engine.submit("s", true);
+  const secondRun = await engine.submit("s", true);
   const prs = await provider.listPullRequests();
 
-  assert.equal(firstRun.updated.length, 2);
-  assert.equal(secondRun.created.length, 0);
-  assert.equal(secondRun.updated.length, 0);
-  assert.equal(secondRun.reused.length, 2);
+  assert.equal(firstRun.applied, true);
+  assert.equal(secondRun.applied, true);
   assert.equal(prs.length, 2);
   assert.equal(provider.comments.length, 1);
   assert.equal(prs.find((pr) => pr.id === first.id)?.targetBranch, "main");
@@ -249,7 +245,7 @@ test("submit rejects a branch that does not contain its parent", async () => {
   git.setAncestor("a", "b", false);
 
   await assert.rejects(
-    engine.submit("s"),
+    engine.submit("s", true),
     /b does not contain a in its history/
   );
   assert.equal(git.applied.length, 0);
@@ -262,12 +258,12 @@ test("validation rejects missing branches and merge commits", async () => {
   await engine.createStack("s", "main", "a");
   await engine.push("s", "b");
   git.deleteBranch("b");
-  await assert.rejects(engine.submit("s"), /Branch b does not exist locally/);
+  await assert.rejects(engine.submit("s", true), /Branch b does not exist locally/);
 
   git.setSha("b", "b-v1");
   git.setMergeCommits("a", "b", ["merge-1"]);
   await assert.rejects(
-    engine.submit("s"),
+    engine.submit("s", true),
     /b contains 1 merge commit/
   );
 });
@@ -283,7 +279,7 @@ test("sync and merge require a clean working tree and no active rebase", async (
 
   git.setDirty(false);
   git.setRebaseInProgress(true);
-  await assert.rejects(engine.submit("s"), /rebase is already in progress/);
+  await assert.rejects(engine.submit("s", true), /rebase is already in progress/);
 });
 
 test("validate reports each successful stack safety check", async () => {
@@ -356,7 +352,7 @@ test("checkout discovers a local stack by branch or PR ID", async () => {
   );
   await engine.createStack("s", "main", "a");
   await engine.push("s", "b");
-  await engine.submit("s");
+  await engine.submit("s", true);
 
   const byBranch = await engine.checkout("b");
   assert.equal(byBranch.stack.name, "s");
@@ -484,6 +480,83 @@ test("approval gate defers mutating sync until approved", async () => {
   await engine.approve(plan.approval!.id);
   assert.ok(git.applied.length > 0, "git ops run after approval");
   assert.equal(store.listApprovals("approved").length, 1);
+});
+
+test("approval gate defers all submit mutations until approved", async () => {
+  const root = join(tmpdir(), "stackpilot-test-submit-approval");
+  await rm(join(root, ".stackpilot"), { recursive: true, force: true });
+  const store = new StackStore(root);
+  await store.load();
+  const config: StackPilotConfig = {
+    provider: "mock",
+    ai: "mock",
+    trunk: "main",
+    requireApproval: true,
+    actor: "tester",
+  };
+  await store.setConfig(config);
+  const git = new MockGitService();
+  const provider = new MockProvider();
+  const engine = new StackManager({
+    provider,
+    git,
+    ai: new MockAIProvider(),
+    store,
+    config,
+  });
+  await engine.createStack("s", "main", "a");
+  await engine.push("s", "b");
+  await provider.createPullRequest({
+    title: "B",
+    description: "",
+    sourceBranch: "b",
+    targetBranch: "wrong-base",
+    dependsOn: [999],
+  });
+  const providerStateBeforeSubmit = await provider.listPullRequests();
+
+  const dryRun = await engine.submit("s", false);
+  assert.equal(dryRun.applied, false);
+  assert.equal(dryRun.approval, undefined);
+  assert.equal(git.applied.length, 0);
+  assert.deepEqual(
+    await provider.listPullRequests(),
+    providerStateBeforeSubmit
+  );
+  assert.equal(provider.comments.length, 0);
+
+  const plan = await engine.submit("s", true);
+  assert.equal(plan.applied, false);
+  assert.ok(plan.approval);
+  assert.equal(git.applied.length, 0);
+  assert.deepEqual(
+    await provider.listPullRequests(),
+    providerStateBeforeSubmit
+  );
+  assert.equal(provider.comments.length, 0);
+  assert.ok(
+    plan.operations.some(
+      (operation) =>
+        operation.kind === "provider" &&
+        operation.command ===
+          "ado pr link --source b --depends-on a"
+    )
+  );
+
+  await engine.approve(plan.approval!.id);
+  assert.deepEqual(
+    git.applied.map((operation) => operation.command),
+    ["git push origin a", "git push origin b"]
+  );
+  const prs = await provider.listPullRequests();
+  assert.equal(prs.length, 2);
+  const basePr = prs.find((pr) => pr.sourceBranch === "a");
+  const upperPr = prs.find((pr) => pr.sourceBranch === "b");
+  assert.ok(basePr);
+  assert.ok(upperPr);
+  assert.equal(upperPr.targetBranch, "a");
+  assert.deepEqual(upperPr.dependsOn, [basePr.id]);
+  assert.equal(provider.comments.length, 1);
 });
 
 test("sync rebases from the recorded base SHA when trunk moves", async () => {

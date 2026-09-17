@@ -39,13 +39,6 @@ export interface SyncItem {
   operations: PlannedOperation[];
 }
 
-export interface SubmitResult {
-  operations: PlannedOperation[];
-  created: PullRequest[];
-  updated: PullRequest[];
-  reused: PullRequest[];
-}
-
 export interface CheckoutResult {
   stack: Stack;
   branch: string;
@@ -144,8 +137,84 @@ export class StackManager {
    * Push every branch and make its active PR match the stack, bottom-up.
    * Existing PRs are reused so this operation is safe to run repeatedly.
    */
-  async submit(stackName: string): Promise<SubmitResult> {
+  async submit(stackName: string, apply: boolean): Promise<PlanResult> {
     const stack = this.requireStack(stackName);
+    await validateStack(stack, this.deps.git, "submit");
+    const operations = await this.planSubmit(stack);
+    const messages = operations.map((operation) => operation.description);
+
+    return this.runOrGate({
+      stack,
+      action: "stack.submit",
+      description: `Submit ${stack.name}`,
+      operations,
+      apply,
+      messages,
+      effect: { kind: "submit", stackId: stack.id },
+    });
+  }
+
+  private async planSubmit(stack: Stack): Promise<PlannedOperation[]> {
+    const operations: PlannedOperation[] = [];
+    const activeByBranch = activePullRequestsByBranch(
+      await this.deps.provider.listPullRequests()
+    );
+    let basePr: PullRequest | undefined;
+    let baseBranch: string | undefined;
+
+    for (const branch of [...stack.branches].sort(
+      (a, b) => a.level - b.level
+    )) {
+      operations.push(this.deps.git.planPush(branch.name, false));
+      const dependsOn = basePr ? [basePr.id] : [];
+      const pr = activeByBranch.get(branch.name);
+      const dependency = basePr ? String(basePr.id) : baseBranch;
+
+      if (!pr) {
+        operations.push({
+          kind: "provider",
+          command: `ado pr create --source ${branch.name} --target ${branch.base}`,
+          description: `Create PR for ${branch.name} → ${branch.base}`,
+          mutating: true,
+        });
+        if (baseBranch) {
+          const dependencyLabel = basePr ? `PR !${basePr.id}` : baseBranch;
+          operations.push({
+            kind: "provider",
+            command: `ado pr link --source ${branch.name} --depends-on ${dependency}`,
+            description: `Link ${branch.name} to depend on ${dependencyLabel}`,
+            mutating: true,
+          });
+        }
+      } else {
+        const targetChanged = pr.targetBranch !== branch.base;
+        const dependencyChanged = baseBranch
+          ? !basePr || !sameNumbers(pr.dependsOn, dependsOn)
+          : pr.dependsOn.length > 0;
+        if (targetChanged || dependencyChanged) {
+          operations.push({
+            kind: "provider",
+            command: `ado pr update ${pr.id} --target ${branch.base} --depends-on ${dependency ?? "none"}`,
+            description: `Update PR !${pr.id} to match ${branch.name} → ${branch.base}`,
+            mutating: true,
+          });
+        }
+        if (dependencyChanged && baseBranch) {
+          operations.push({
+            kind: "provider",
+            command: `ado pr link --source ${branch.name} --depends-on ${dependency}`,
+            description: `Link PR !${pr.id} to depend on ${basePr ? `PR !${basePr.id}` : baseBranch}`,
+            mutating: true,
+          });
+        }
+      }
+      basePr = pr;
+      baseBranch = branch.name;
+    }
+    return operations;
+  }
+
+  private async applySubmit(stack: Stack): Promise<void> {
     await validateStack(stack, this.deps.git, "submit");
     const operations: PlannedOperation[] = [];
     const created: PullRequest[] = [];
@@ -235,7 +304,6 @@ export class StackManager {
       details: { operations: operations.map((op) => op.command) },
       applied: true,
     });
-    return { operations, created, updated, reused };
   }
 
   /** Create PRs for any stacked branch that doesn't yet have one, bottom-up. */
@@ -441,6 +509,11 @@ export class StackManager {
 
   /** Apply the semantic state change for an approved/immediate plan. */
   private async applyEffect(effect: StackEffect): Promise<void> {
+    if (effect.kind === "submit") {
+      await this.applySubmit(this.requireStack(effect.stackId));
+      return;
+    }
+
     if (effect.kind === "sync") {
       const stack = this.requireStack(effect.stackId);
       for (const b of stack.branches) {
@@ -530,17 +603,18 @@ export class StackManager {
       applied: false,
     });
 
-    for (const op of req.operations) await this.deps.git.apply(op);
-    if (req.effect) await this.applyEffect(req.effect);
+    await this.applyPlan(req.operations, req.effect);
 
-    await this.deps.store.appendAudit({
-      action: req.action,
-      actor: this.actor,
-      stackId: req.stackId,
-      summary: `Applied ${req.operations.length} operation(s): ${req.description}`,
-      details: { operations: req.operations.map((o) => o.command) },
-      applied: true,
-    });
+    if (req.action !== "stack.submit") {
+      await this.deps.store.appendAudit({
+        action: req.action,
+        actor: this.actor,
+        stackId: req.stackId,
+        summary: `Applied ${req.operations.length} operation(s): ${req.description}`,
+        details: { operations: req.operations.map((o) => o.command) },
+        applied: true,
+      });
+    }
     return { operations: req.operations, applied: true, messages: [`Applied: ${req.description}`] };
   }
 
@@ -700,17 +774,30 @@ export class StackManager {
       };
     }
 
-    for (const op of operations) await this.deps.git.apply(op);
-    await this.applyEffect(effect);
-    await this.deps.store.appendAudit({
-      action,
-      actor: this.actor,
-      stackId: stack.id,
-      summary: `Applied: ${description}`,
-      details: { operations: operations.map((o) => o.command) },
-      applied: true,
-    });
+    await this.applyPlan(operations, effect);
+    if (action !== "stack.submit") {
+      await this.deps.store.appendAudit({
+        action,
+        actor: this.actor,
+        stackId: stack.id,
+        summary: `Applied: ${description}`,
+        details: { operations: operations.map((o) => o.command) },
+        applied: true,
+      });
+    }
     return { operations, applied: true, messages: [...messages, `Applied: ${description}`] };
+  }
+
+  private async applyPlan(
+    operations: PlannedOperation[],
+    effect?: StackEffect
+  ): Promise<void> {
+    if (effect?.kind === "submit") {
+      await this.applyEffect(effect);
+      return;
+    }
+    for (const op of operations) await this.deps.git.apply(op);
+    if (effect) await this.applyEffect(effect);
   }
 
   requireStack(nameOrId: string): Stack {
