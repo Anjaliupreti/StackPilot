@@ -12,6 +12,7 @@ export type AuditAction =
   | "stack.create"
   | "stack.push"
   | "stack.pop"
+  | "stack.submit"
   | "pr.create"
   | "pr.update"
   | "pr.link"
@@ -50,6 +51,8 @@ export interface StackedBranch {
   prId?: number;
   /** Last commit SHA StackPilot recorded for drift detection. */
   lastKnownSha?: string;
+  /** Commit SHA of `base` when this branch was last synchronized. */
+  lastKnownBaseSha?: string;
 }
 
 /** Full stack definition persisted by StackPilot. */

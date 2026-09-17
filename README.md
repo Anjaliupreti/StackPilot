@@ -93,10 +93,13 @@ node dist/index.js create auth-feature feature/auth-schema
 node dist/index.js push   auth-feature feature/auth-service
 node dist/index.js push   auth-feature feature/auth-api
 
-node dist/index.js pr       auth-feature          # open linked PRs
+node dist/index.js submit   auth-feature          # push and create/update linked PRs
 node dist/index.js describe auth-feature --show    # AI descriptions
 node dist/index.js review   auth-feature           # stack-aware review
 node dist/index.js status   auth-feature
+node dist/index.js top      auth-feature           # switch between stack branches
+node dist/index.js down     auth-feature
+node dist/index.js trunk    auth-feature
 
 node dist/index.js sync  auth-feature --apply       # plan a restack (asks approval)
 node dist/index.js approvals --pending
@@ -105,6 +108,9 @@ node dist/index.js approve <id>
 node dist/index.js merge auth-feature --apply       # merge bottom + restack
 node dist/index.js audit auth-feature
 ```
+
+`submit` is idempotent: it reuses active PRs, fixes their target branches and
+dependency markers when needed, and creates only missing PRs.
 
 > Tip: the `stackpilot` and `sp` bin names are available after `npm link`.
 

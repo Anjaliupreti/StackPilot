@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { promisify } from "node:util";
 import type { PlannedOperation } from "../core/types.js";
 
@@ -13,6 +15,12 @@ export interface GitService {
   readonly name: string;
   currentBranch(): Promise<string>;
   headSha(branch?: string): Promise<string>;
+  branchExists(branch: string): Promise<boolean>;
+  isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+  mergeCommitsBetween(base: string, head: string): Promise<string[]>;
+  hasUncommittedChanges(): Promise<boolean>;
+  isRebaseInProgress(): Promise<boolean>;
+  switchBranch(branch: string): Promise<void>;
   /** Commit subjects present on `head` but not on `base`. */
   commitsBetween(base: string, head: string): Promise<string[]>;
   /** File paths changed on `head` relative to `base`. */
@@ -42,6 +50,50 @@ export class RealGitService implements GitService {
 
   async headSha(branch = "HEAD"): Promise<string> {
     return this.git(["rev-parse", branch]);
+  }
+
+  async branchExists(branch: string): Promise<boolean> {
+    try {
+      await this.git(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+      return true;
+    } catch (error) {
+      if (hasExitCode(error, 1)) return false;
+      throw error;
+    }
+  }
+
+  async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    try {
+      await this.git(["merge-base", "--is-ancestor", ancestor, descendant]);
+      return true;
+    } catch (error) {
+      if (hasExitCode(error, 1)) return false;
+      throw error;
+    }
+  }
+
+  async mergeCommitsBetween(base: string, head: string): Promise<string[]> {
+    const out = await this.git(["rev-list", "--merges", `${base}..${head}`]);
+    return out ? out.split("\n").filter(Boolean) : [];
+  }
+
+  async hasUncommittedChanges(): Promise<boolean> {
+    return (await this.git(["status", "--porcelain"])).length > 0;
+  }
+
+  async isRebaseInProgress(): Promise<boolean> {
+    const [mergePath, applyPath] = await Promise.all([
+      this.git(["rev-parse", "--git-path", "rebase-merge"]),
+      this.git(["rev-parse", "--git-path", "rebase-apply"]),
+    ]);
+    return (
+      existsSync(resolve(this.cwd, mergePath)) ||
+      existsSync(resolve(this.cwd, applyPath))
+    );
+  }
+
+  async switchBranch(branch: string): Promise<void> {
+    await this.git(["switch", branch]);
   }
 
   async commitsBetween(base: string, head: string): Promise<string[]> {
@@ -102,6 +154,10 @@ export class MockGitService implements GitService {
   readonly applied: PlannedOperation[] = [];
   private current = "main";
   private shas = new Map<string, string>();
+  private invalidAncestry = new Set<string>();
+  private mergeCommits = new Map<string, string[]>();
+  private dirty = false;
+  private rebasing = false;
 
   constructor(private readonly seed?: {
     branchCommits?: Record<string, string[]>;
@@ -123,9 +179,67 @@ export class MockGitService implements GitService {
     return this.shas.get(branch)!;
   }
 
+  async branchExists(branch: string): Promise<boolean> {
+    return this.shas.has(branch);
+  }
+
+  async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    return !this.invalidAncestry.has(`${ancestor}\0${descendant}`);
+  }
+
+  async mergeCommitsBetween(base: string, head: string): Promise<string[]> {
+    return this.mergeCommits.get(`${base}\0${head}`) ?? [];
+  }
+
+  async hasUncommittedChanges(): Promise<boolean> {
+    return this.dirty;
+  }
+
+  async isRebaseInProgress(): Promise<boolean> {
+    return this.rebasing;
+  }
+
+  async switchBranch(branch: string): Promise<void> {
+    if (!(await this.branchExists(branch))) {
+      throw new Error(`Branch ${branch} does not exist`);
+    }
+    this.current = branch;
+  }
+
   /** Force a new SHA for a branch to simulate upstream drift. */
   bumpSha(branch: string): void {
     this.shas.set(branch, randomSha());
+  }
+
+  /** Set a predictable SHA for tests and demos. */
+  setSha(branch: string, sha: string): void {
+    this.shas.set(branch, sha);
+  }
+
+  deleteBranch(branch: string): void {
+    this.shas.delete(branch);
+  }
+
+  setAncestor(
+    ancestor: string,
+    descendant: string,
+    isAncestor: boolean
+  ): void {
+    const key = `${ancestor}\0${descendant}`;
+    if (isAncestor) this.invalidAncestry.delete(key);
+    else this.invalidAncestry.add(key);
+  }
+
+  setMergeCommits(base: string, head: string, commits: string[]): void {
+    this.mergeCommits.set(`${base}\0${head}`, commits);
+  }
+
+  setDirty(dirty: boolean): void {
+    this.dirty = dirty;
+  }
+
+  setRebaseInProgress(rebasing: boolean): void {
+    this.rebasing = rebasing;
   }
 
   async commitsBetween(_base: string, head: string): Promise<string[]> {
@@ -172,4 +286,13 @@ function randomSha(): string {
   return Array.from({ length: 40 }, () =>
     "0123456789abcdef"[Math.floor(Math.random() * 16)]
   ).join("");
+}
+
+function hasExitCode(error: unknown, code: number): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === code
+  );
 }
