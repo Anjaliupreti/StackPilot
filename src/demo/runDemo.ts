@@ -66,7 +66,12 @@ async function main() {
   };
   await store.setConfig(config);
 
-  const provider = new MockProvider({ branches: ["main"], repositoryUrl: "https://dev.azure.com/contoso/Payments/_git/payments-service" });
+  const provider = new MockProvider({
+    branches: ["main"],
+    repositoryUrl:
+      "https://dev.azure.com/contoso/Payments/_git/payments-service",
+    persistFile: join(root, ".stackpilot", "mock-provider.json"),
+  });
   const git = new MockGitService(seed);
   const ai = new MockAIProvider();
   const engine = new StackManager({ provider, git, ai, store, config });

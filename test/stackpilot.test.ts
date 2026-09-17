@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
-import { rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import { MockAIProvider } from "../src/ai/mockAi.js";
 import { parseComment } from "../src/cli/commentCommands.js";
+import { buildContext } from "../src/cli/context.js";
+import { renderStackJson } from "../src/cli/render.js";
 import { StackManager } from "../src/core/stackManager.js";
 import type { StackPilotConfig } from "../src/core/types.js";
-import { MockGitService } from "../src/git/gitService.js";
+import { MockGitService, RealGitService } from "../src/git/gitService.js";
 import {
   embedDependsOn,
   parseDependsOn,
@@ -15,6 +19,8 @@ import {
 } from "../src/providers/ado/adoProvider.js";
 import { MockProvider } from "../src/providers/mock/mockProvider.js";
 import { StackStore } from "../src/store/stackStore.js";
+
+const execFileAsync = promisify(execFile);
 
 async function makeEngine(root: string) {
   await rm(join(root, ".stackpilot"), { recursive: true, force: true });
@@ -57,6 +63,83 @@ test("parseComment recognises triggers and verbs", () => {
   assert.deepEqual(parseComment("/sp status")?.verb, "status");
   assert.deepEqual(parseComment("@stackpilot review")?.verb, "review");
   assert.equal(parseComment("just a normal comment"), undefined);
+});
+
+test("stack status JSON is ordered and machine-readable", async () => {
+  const { engine } = await makeEngine(
+    join(tmpdir(), "stackpilot-test-status-json")
+  );
+  await engine.createStack("s", "main", "a");
+  await engine.push("s", "b");
+  await engine.push("s", "c");
+  await engine.submit("s");
+
+  const stack = engine.requireStack("s");
+  const output = JSON.parse(
+    renderStackJson(stack, await engine.prsFor(stack))
+  );
+
+  assert.equal(output.name, "s");
+  assert.equal(output.trunk, "main");
+  assert.deepEqual(
+    output.branches.map(
+      (branch: {
+        name: string;
+        targetBranch: string;
+        prId: number;
+        status: string;
+        dependsOn: number[];
+      }) => ({
+        name: branch.name,
+        targetBranch: branch.targetBranch,
+        prId: branch.prId,
+        status: branch.status,
+        dependsOn: branch.dependsOn,
+      })
+    ),
+    [
+      {
+        name: "a",
+        targetBranch: "main",
+        prId: 101,
+        status: "active",
+        dependsOn: [],
+      },
+      {
+        name: "b",
+        targetBranch: "a",
+        prId: 102,
+        status: "active",
+        dependsOn: [101],
+      },
+      {
+        name: "c",
+        targetBranch: "b",
+        prId: 103,
+        status: "active",
+        dependsOn: [102],
+      },
+    ]
+  );
+});
+
+test("stack status JSON represents branches without PRs", async () => {
+  const { engine } = await makeEngine(
+    join(tmpdir(), "stackpilot-test-status-json-no-pr")
+  );
+  await engine.createStack("s", "main", "a");
+  const stack = engine.requireStack("s");
+
+  const output = JSON.parse(renderStackJson(stack, []));
+
+  assert.deepEqual(output.branches[0], {
+    level: 0,
+    name: "a",
+    targetBranch: "main",
+    prId: null,
+    status: "not_created",
+    dependsOn: [],
+  });
 });
 
 test("PRs are created bottom-up with dependency links", async () => {
@@ -203,6 +286,53 @@ test("sync and merge require a clean working tree and no active rebase", async (
   await assert.rejects(engine.submit("s"), /rebase is already in progress/);
 });
 
+test("validate reports each successful stack safety check", async () => {
+  const { engine } = await makeEngine(
+    join(tmpdir(), "stackpilot-test-validate-report")
+  );
+  await engine.createStack("s", "main", "a");
+  await engine.push("s", "b");
+
+  const result = await engine.validate("s");
+
+  assert.deepEqual(result.checks, [
+    "No Git rebase is in progress",
+    "Working tree is clean",
+    "All branches exist",
+    "a contains main",
+    "b contains a",
+    "Stack history is linear",
+  ]);
+});
+
+test("real Git dirty check ignores StackPilot state only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "stackpilot-real-git-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await mkdir(join(root, ".stackpilot"));
+  await writeFile(join(root, ".stackpilot", "state.json"), "{}");
+  const git = new RealGitService(root);
+
+  assert.equal(await git.hasUncommittedChanges(), false);
+
+  await writeFile(join(root, "user-change.txt"), "change");
+  assert.equal(await git.hasUncommittedChanges(), true);
+});
+
+test("offline context restores mock branches from persisted stack state", async () => {
+  const root = join(tmpdir(), "stackpilot-test-persisted-mock-git");
+  const { engine } = await makeEngine(root);
+  await engine.createStack("s", "main", "a");
+  await engine.push("s", "b");
+
+  const restored = await buildContext(root);
+  const result = await restored.engine.validate("s");
+
+  assert.ok(result.checks.includes("All branches exist"));
+  assert.equal(await restored.git.branchExists("main"), true);
+  assert.equal(await restored.git.branchExists("a"), true);
+  assert.equal(await restored.git.branchExists("b"), true);
+});
+
 test("navigation switches between ordered stack branches", async () => {
   const { engine, git } = await makeEngine(
     join(tmpdir(), "stackpilot-test-navigation")
@@ -218,6 +348,47 @@ test("navigation switches between ordered stack branches", async () => {
   assert.equal(await engine.navigate("s", "down"), "b");
   assert.equal(await engine.navigate("s", "trunk"), "main");
   assert.equal(await git.currentBranch(), "main");
+});
+
+test("checkout discovers a local stack by branch or PR ID", async () => {
+  const { engine, git } = await makeEngine(
+    join(tmpdir(), "stackpilot-test-checkout")
+  );
+  await engine.createStack("s", "main", "a");
+  await engine.push("s", "b");
+  await engine.submit("s");
+
+  const byBranch = await engine.checkout("b");
+  assert.equal(byBranch.stack.name, "s");
+  assert.equal(byBranch.branch, "b");
+  assert.equal(await git.currentBranch(), "b");
+
+  const byPr = await engine.checkout("101");
+  assert.equal(byPr.stack.name, "s");
+  assert.equal(byPr.branch, "a");
+  assert.equal(await git.currentBranch(), "a");
+});
+
+test("checkout reports missing and ambiguous local stack matches", async () => {
+  const { engine } = await makeEngine(
+    join(tmpdir(), "stackpilot-test-checkout-errors")
+  );
+  await engine.createStack("first", "main", "shared");
+  await engine.createStack("second", "main", "other");
+  await engine.push("second", "shared");
+
+  await assert.rejects(
+    engine.checkout("missing"),
+    /Branch missing is not part of a local stack/
+  );
+  await assert.rejects(
+    engine.checkout("999"),
+    /PR !999 is not part of a local stack/
+  );
+  await assert.rejects(
+    engine.checkout("shared"),
+    /matches multiple local stacks/
+  );
 });
 
 test("merge completes the bottom PR and restacks the rest onto trunk", async () => {
@@ -328,6 +499,11 @@ test("sync rebases from the recorded base SHA when trunk moves", async () => {
   git.setSha("main", "main-v2");
   const plan = await engine.sync("s", false);
 
+  assert.deepEqual(plan.messages, [
+    "↻ a: replay commits after main-v1 onto main (main moved)",
+    "↻ b: replay commits after a-v1 onto a (a will be rebased)",
+    "(dry run — pass --apply to execute)",
+  ]);
   assert.deepEqual(
     plan.operations.map((op) => op.command),
     [

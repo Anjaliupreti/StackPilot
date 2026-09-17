@@ -12,7 +12,10 @@ import type {
   StackEffect,
   StackPilotConfig,
 } from "./types.js";
-import { validateStack } from "./stackValidator.js";
+import {
+  validateStack,
+  type ValidationResult,
+} from "./stackValidator.js";
 
 export interface EngineDeps {
   provider: Provider;
@@ -41,6 +44,11 @@ export interface SubmitResult {
   created: PullRequest[];
   updated: PullRequest[];
   reused: PullRequest[];
+}
+
+export interface CheckoutResult {
+  stack: Stack;
+  branch: string;
 }
 
 export type NavigationTarget = "top" | "bottom" | "up" | "down" | "trunk";
@@ -357,8 +365,11 @@ export class StackManager {
         );
         const push = this.deps.git.planPush(b.name, true);
         operations.push(rebase, push);
+        const reason = baseMoved
+          ? `${b.base} moved`
+          : `${b.base} will be rebased`;
         messages.push(
-          `↻ ${b.name} needs restack onto ${b.base} (base moved)`
+          `↻ ${b.name}: replay commits after ${shortSha(oldBaseSha)} onto ${b.base} (${reason})`
         );
         parentWillMove = true;
       } else {
@@ -549,6 +560,14 @@ export class StackManager {
 
   // ---- helpers ----------------------------------------------------------
 
+  async validate(stackName: string): Promise<ValidationResult> {
+    return validateStack(
+      this.requireStack(stackName),
+      this.deps.git,
+      "validate"
+    );
+  }
+
   async navigate(
     stackName: string,
     target: NavigationTarget
@@ -593,6 +612,43 @@ export class StackManager {
       await this.deps.git.switchBranch(destination);
     }
     return destination;
+  }
+
+  async checkout(branchOrPr: string): Promise<CheckoutResult> {
+    const prId = /^\d+$/.test(branchOrPr) ? Number(branchOrPr) : undefined;
+    const matches = this.deps.store
+      .listStacks()
+      .flatMap((stack) =>
+        stack.branches
+          .filter((branch) =>
+            prId === undefined
+              ? branch.name === branchOrPr
+              : branch.prId === prId
+          )
+          .map((branch) => ({ stack, branch: branch.name }))
+      );
+
+    if (matches.length === 0) {
+      throw new Error(
+        prId === undefined
+          ? `Branch ${branchOrPr} is not part of a local stack`
+          : `PR !${prId} is not part of a local stack`
+      );
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `${branchOrPr} matches multiple local stacks; use a unique branch or PR ID`
+      );
+    }
+
+    const match = matches[0];
+    if (!(await this.deps.git.branchExists(match.branch))) {
+      throw new Error(`Branch ${match.branch} does not exist locally`);
+    }
+    if ((await this.deps.git.currentBranch()) !== match.branch) {
+      await this.deps.git.switchBranch(match.branch);
+    }
+    return match;
   }
 
   /**
@@ -717,6 +773,10 @@ function activePullRequestsByBranch(
 
 function sameNumbers(a: number[], b: number[]): boolean {
   return a.length === b.length && a.every((value, i) => value === b[i]);
+}
+
+function shortSha(sha: string): string {
+  return sha.slice(0, 12);
 }
 
 async function safeSha(git: GitService, branch: string): Promise<string | undefined> {
